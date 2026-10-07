@@ -19,9 +19,18 @@ defined( 'ABSPATH' ) || exit;
  *   {{nc_camera}}    Kameramodell
  * Fallback: {{nc_caption|nc_title}} oder {{nc_caption|Freier Text}} – wird verwendet, wenn das Feld leer ist.
  */
+/** Interne Markierung: Etappe beendet, weitere folgen. */
+class RSNC_Batch_Pause extends Exception {}
+
 class RSNC_Sync {
 
 	const LOCK = 'rsnc_lock_';
+
+	/** Zuordnung, die gerade läuft, und Bild, das gerade verarbeitet wird (für Absturzmeldungen). */
+	private static $running = null;
+	private static $current = null;
+	private static $shutdown_registered = false;
+	private static $deadline = null;
 
 	private static function slides_table() {
 		global $wpdb;
@@ -38,9 +47,116 @@ class RSNC_Sync {
 	public static function run_all() {
 		foreach ( RSNC_Settings::get_mappings() as $id => $m ) {
 			if ( ! empty( $m['active'] ) ) {
-				self::run( $id );
+				self::continue_run( $id );
 			}
 		}
+	}
+
+	/** Cron: eine Etappe ausführen und bei Bedarf die nächste einplanen. */
+	public static function continue_run( $mapping_id ) {
+		$r = self::run( $mapping_id );
+		if ( ! empty( $r['pending'] ) || ! empty( $r['busy'] ) ) {
+			self::schedule_continue( $mapping_id, ! empty( $r['busy'] ) ? 120 : 15 );
+		}
+		return $r;
+	}
+
+	public static function schedule_continue( $mapping_id, $delay = 15 ) {
+		if ( ! wp_next_scheduled( 'rsnc_cron_continue', array( $mapping_id ) ) ) {
+			wp_schedule_single_event( time() + $delay, 'rsnc_cron_continue', array( $mapping_id ) );
+		}
+	}
+
+	/** Übersprungene Bilder erneut versuchen (manueller Abgleich). */
+	public static function reset_failed( $mapping_id ) {
+		delete_option( 'rsnc_failed_' . $mapping_id );
+	}
+
+	/* =====================================================================
+	 * Zeitbudget – der Abgleich läuft in Etappen, damit das Zeitlimit des
+	 * Servers (oft 30–60 s, nicht erhöhbar) nie erreicht wird.
+	 * ===================================================================== */
+
+	private static function deadline() {
+		if ( null === self::$deadline ) {
+			if ( function_exists( 'set_time_limit' ) ) {
+				@set_time_limit( 300 ); // phpcs:ignore -- wirkt nur, wenn der Hoster es erlaubt
+			}
+			$limit = (int) ini_get( 'max_execution_time' );
+			if ( defined( 'WP_CLI' ) && WP_CLI ) {
+				$budget = 0; // Kommandozeile: kein Limit
+			} else {
+				$budget = $limit > 0 ? min( 20, max( 5, $limit * 0.5 ) ) : 20;
+			}
+			$budget = (float) apply_filters( 'rsnc_time_budget', $budget, $limit );
+			$start  = isset( $_SERVER['REQUEST_TIME_FLOAT'] ) ? (float) $_SERVER['REQUEST_TIME_FLOAT'] : microtime( true );
+			self::$deadline = $budget > 0 ? $start + $budget : 0;
+		}
+		return self::$deadline;
+	}
+
+	/* =====================================================================
+	 * Absturzschutz – bricht PHP ab (Zeitlimit, Arbeitsspeicher), wird die
+	 * Sperre sofort freigegeben und die Ursache in der Admin-Seite angezeigt.
+	 * ===================================================================== */
+
+	public static function on_shutdown() {
+		if ( null === self::$running ) {
+			return;
+		}
+		$err = error_get_last();
+		if ( ! $err || ! in_array( $err['type'], array( E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR, E_RECOVERABLE_ERROR ), true ) ) {
+			return;
+		}
+		$id   = self::$running;
+		$cur  = self::$current;
+		$name = $cur ? $cur['name'] : '';
+		$msg  = $err['message'];
+
+		if ( false !== stripos( $msg, 'Maximum execution time' ) ) {
+			/* translators: 1: seconds 2: file */
+			$text = sprintf( __( 'Zeitlimit des Servers (%1$s s) bei „%2$s“ überschritten – das Bild ist für den Server zu aufwendig. Bild in Nextcloud verkleinern (z. B. auf 3000 px Breite) oder beim Hoster max_execution_time erhöhen.', 'rs-nextcloud' ), ini_get( 'max_execution_time' ), $name ? $name : '?' );
+		} elseif ( false !== stripos( $msg, 'Allowed memory size' ) ) {
+			/* translators: 1: file 2: memory limit */
+			$text = sprintf( __( 'Arbeitsspeicher des Servers (%2$s) reicht nicht für „%1$s“. Bild in Nextcloud verkleinern oder in wp-config.php WP_MAX_MEMORY_LIMIT erhöhen (z. B. 512M).', 'rs-nextcloud' ), $name, ini_get( 'memory_limit' ) );
+		} else {
+			$text = sprintf( 'PHP-Fehler%s: %s (%s:%d)', $name ? ' bei „' . $name . '“' : '', $msg, wp_basename( $err['file'] ), $err['line'] );
+		}
+
+		// Bild merken – nach dem zweiten Absturz am selben Bild wird es übersprungen.
+		if ( $cur ) {
+			$failed                  = get_option( 'rsnc_failed_' . $id, array() );
+			$failed                  = is_array( $failed ) ? $failed : array();
+			$prev                    = $failed[ $cur['path'] ] ?? array( 'n' => 0, 'fp' => '' );
+			$failed[ $cur['path'] ]  = array(
+				'n'   => $prev['fp'] === $cur['fp'] ? $prev['n'] + 1 : 1,
+				'fp'  => $cur['fp'],
+				'msg'  => $text,
+				'time' => time(),
+			);
+			update_option( 'rsnc_failed_' . $id, $failed, false );
+		}
+
+		self::unlock( $id );
+		$status = RSNC_Settings::get_status( $id );
+		$status = is_array( $status ) ? $status : array();
+		RSNC_Settings::set_status(
+			$id,
+			array_merge(
+				array( 'added' => 0, 'updated' => 0, 'removed' => 0, 'unchanged' => 0, 'renamed' => 0, 'duplicates' => array(), 'cleaned' => 0 ),
+				$status,
+				array(
+					'errors'      => array( $text ),
+					'interrupted' => true,
+					'pending'     => max( 1, (int) ( $status['pending'] ?? 1 ) ),
+					'time'        => time(),
+				)
+			)
+		);
+		if ( ! ( defined( 'WP_CLI' ) && WP_CLI ) ) {
+			self::schedule_continue( $id, 60 );
+		}
+		self::$running = null;
 	}
 
 	/* =====================================================================
@@ -143,6 +259,9 @@ class RSNC_Sync {
 	 */
 	public static function run( $mapping_id ) {
 		$result = array(
+			'pending'    => 0,
+			'total'      => 0,
+			'busy'       => false,
 			'added'      => 0,
 			'updated'    => 0,
 			'removed'    => 0,
@@ -159,17 +278,30 @@ class RSNC_Sync {
 			$result['errors'][] = 'Zuordnung nicht gefunden.';
 			return $result;
 		}
+		$deadline = self::deadline();
+		if ( $deadline && microtime( true ) > $deadline ) {
+			// Zeitbudget dieses Aufrufs schon verbraucht (z. B. mehrere Zuordnungen im Cron).
+			$result['pending'] = -1;
+			return $result;
+		}
 		if ( ! self::lock( $mapping_id ) ) {
+			$result['busy']     = true;
 			$result['errors'][] = __( 'Ein Abgleich läuft bereits.', 'rs-nextcloud' );
 			return $result;
 		}
+		if ( ! self::$shutdown_registered ) {
+			register_shutdown_function( array( __CLASS__, 'on_shutdown' ) );
+			self::$shutdown_registered = true;
+		}
+		self::$running = $mapping_id;
+		self::$current = null;
 
 		try {
 			if ( ! rsnc_revslider_active() || ! self::tables_ok() ) {
 				throw new RuntimeException( __( 'Slider Revolution 6 ist nicht aktiv oder seine Tabellen fehlen.', 'rs-nextcloud' ) );
 			}
-			if ( function_exists( 'set_time_limit' ) ) {
-				@set_time_limit( 600 ); // phpcs:ignore
+			if ( function_exists( 'wp_raise_memory_limit' ) ) {
+				wp_raise_memory_limit( 'image' );
 			}
 			require_once ABSPATH . 'wp-admin/includes/file.php';
 			require_once ABSPATH . 'wp-admin/includes/media.php';
@@ -207,16 +339,63 @@ class RSNC_Sync {
 					$by_hash[ $state[ $k ]['hash'] ] = $k;
 				}
 			}
+			self::save_state( $mapping_id, $state );
+
+			$failed       = get_option( 'rsnc_failed_' . $mapping_id, array() );
+			$failed       = is_array( $failed ) ? $failed : array();
+			$failed_dirty = false;
+			$slowest      = 0.0;
+			$done         = 0;
+			$result['total'] = count( $files );
 
 			foreach ( $files as $key => $file ) {
+				// Zeitbudget: aufhören, bevor das nächste (aufwendige) Bild das Limit sprengt.
+				if ( $deadline && $done > 0 && microtime( true ) + max( 1.0, $slowest * 1.5 ) > $deadline ) {
+					$result['pending'] = count( $files ) - $done;
+					break;
+				}
+				$done++;
+
+				// Bild, an dem PHP schon zweimal abgestürzt ist → überspringen, bis es sich ändert.
+				$fp = self::fingerprint( $file );
+				if ( isset( $failed[ $key ] ) ) {
+					// Nach 6 Stunden gibt es einen neuen Versuch (z. B. nachdem der Hoster Limits erhöht hat).
+					if ( $failed[ $key ]['fp'] === $fp && $failed[ $key ]['n'] >= 2 && time() - (int) ( $failed[ $key ]['time'] ?? 0 ) < 6 * HOUR_IN_SECONDS ) {
+						/* translators: %s: reason */
+						$result['errors'][] = sprintf( __( '„%1$s“ übersprungen (zweimal abgebrochen): %2$s', 'rs-nextcloud' ), $file['name'], $failed[ $key ]['msg'] );
+						continue;
+					}
+				}
+
+				self::$current = array(
+					'path' => $key,
+					'name' => $file['name'],
+					'fp'   => $fp,
+				);
+				$t0 = microtime( true );
 				try {
 					$changed = self::process_file( $key, $file, $files, $state, $by_hash, $client, $template, $m, $mapping_id, $slider_id, $rebuild, $order, $result );
 					if ( $changed ) {
 						self::save_state( $mapping_id, $state ); // nach jedem Bild sichern
 					}
+					if ( isset( $failed[ $key ] ) ) {
+						unset( $failed[ $key ] );
+						$failed_dirty = true;
+					}
 				} catch ( Exception $e ) {
 					$result['errors'][] = $file['name'] . ': ' . $e->getMessage();
 				}
+				self::$current = null;
+				$slowest       = max( $slowest, microtime( true ) - $t0 );
+			}
+			if ( $failed_dirty ) {
+				update_option( 'rsnc_failed_' . $mapping_id, $failed, false );
+			}
+
+			if ( $result['pending'] > 0 ) {
+				// Etappe beendet – Aufräumen erst, wenn alle Bilder verarbeitet sind.
+				self::save_state( $mapping_id, $state );
+				throw new RSNC_Batch_Pause();
 			}
 
 			// Duplikate erneut prüfen, deren Original sich in diesem Lauf geändert hat.
@@ -260,10 +439,13 @@ class RSNC_Sync {
 				update_option( 'rsnc_tplhash_' . $mapping_id, $tpl_hash, false );
 			}
 			do_action( 'rsnc_after_sync', $mapping_id, $result );
+		} catch ( RSNC_Batch_Pause $e ) { // phpcs:ignore -- Etappe beendet, kein Fehler
 		} catch ( Exception $e ) {
 			$result['errors'][] = $e->getMessage();
 		}
 
+		self::$running = null;
+		self::$current = null;
 		self::unlock( $mapping_id );
 		RSNC_Settings::set_status( $mapping_id, $result );
 		return $result;

@@ -54,6 +54,10 @@ Die Caption wird außerdem als Beschriftung und Alt-Text in der Mediathek gespei
   WordPress verkleinert diese Bilder nicht zu „-scaled“; für kleinere Dateien im
   Slider die Option „Bildgröße“ verwenden (z. B. „2048x2048“ oder „large“).
   Bilder aus Version 1.2 werden beim ersten Lauf lokal auf den Originalnamen umgestellt.
+- Der Abgleich läuft in Etappen von höchstens 20 Sekunden, damit das Zeitlimit des
+  Servers (bei vielen Hostern 30–60 s, nicht erhöhbar) nie erreicht wird.
+  „Jetzt abgleichen“ arbeitet die Etappen im Browser ab und zeigt den Fortschritt;
+  der Cron plant die nächste Etappe selbst ein.
 - Automatisch per WP-Cron (stündlich / 2× täglich / täglich) oder manuell.
 - WP-CLI: wp rsnc list | wp rsnc sync <id> | wp rsnc sync --all
 - Tipp: Für zuverlässige Läufe echten Server-Cron statt WP-Cron verwenden.
@@ -82,6 +86,16 @@ Neue Version veröffentlichen:
 
 WordPress prüft etwa alle 12 Stunden; „Speichern & nach Updates suchen“ prüft sofort.
 Nur veröffentlichte Releases zählen – Entwürfe und Pre-Releases werden ignoriert.
+
+== Fehlerbehebung ==
+- Bricht PHP trotzdem ab (Fehler 500), steht die Ursache mit dem Bildnamen in der
+  Spalte „Letzter Abgleich“, z. B. Zeitlimit oder Arbeitsspeicher.
+- Ein Bild, an dem PHP zweimal abbricht, wird übersprungen, damit es den Rest nicht
+  blockiert. Neuer Versuch: nach 6 Stunden automatisch oder sofort per „Jetzt abgleichen“.
+- Abhilfe bei sehr großen Fotos: in Nextcloud verkleinert ablegen (z. B. 3000 px Breite)
+  oder beim Hoster max_execution_time / memory_limit erhöhen;
+  in wp-config.php:  define( 'WP_MAX_MEMORY_LIMIT', '512M' );
+- Ohne Zeitlimit per Kommandozeile:  wp rsnc sync --all
 
 == Hinweise ==
 - Unterstützt den neuen (NC 29+, /public.php/dav/files/TOKEN) und den

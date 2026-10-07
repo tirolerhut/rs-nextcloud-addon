@@ -55,6 +55,8 @@ class RSNC_Settings {
 		update_option( self::OPT_MAPPINGS, $all, false );
 		delete_option( 'rsnc_slides_' . $id );
 		delete_option( 'rsnc_tplhash_' . $id );
+		delete_option( 'rsnc_failed_' . $id );
+		wp_clear_scheduled_hook( 'rsnc_cron_continue', array( $id ) );
 		$status = get_option( self::OPT_STATUS, array() );
 		unset( $status[ $id ] );
 		update_option( self::OPT_STATUS, $status, false );
@@ -83,6 +85,7 @@ class RSNC_Settings {
 
 	public static function unschedule() {
 		wp_clear_scheduled_hook( RSNC_CRON_HOOK );
+		wp_unschedule_hook( 'rsnc_cron_continue' );
 	}
 
 	public static function get_status( $id ) {

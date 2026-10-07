@@ -42,7 +42,9 @@ class RSNC_CLI {
 			: array( $args[0] );
 
 		foreach ( $ids as $id ) {
-			$r = RSNC_Sync::run( $id );
+			do {
+				$r = RSNC_Sync::run( $id );
+			} while ( ! empty( $r['pending'] ) && $r['pending'] > 0 && empty( $r['errors'] ) );
 			WP_CLI::log( sprintf( '%s: +%d ~%d -%d =%d', $id, $r['added'], $r['updated'], $r['removed'], $r['unchanged'] ) );
 			foreach ( $r['errors'] as $e ) {
 				WP_CLI::warning( $e );

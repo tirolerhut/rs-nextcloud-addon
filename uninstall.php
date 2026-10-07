@@ -6,6 +6,8 @@ $maps = get_option( 'rsnc_mappings', array() );
 foreach ( array_keys( (array) $maps ) as $id ) {
 	delete_option( 'rsnc_slides_' . $id );
 	delete_option( 'rsnc_tplhash_' . $id );
+	delete_option( 'rsnc_failed_' . $id );
+	wp_clear_scheduled_hook( 'rsnc_cron_continue', array( $id ) );
 }
 delete_option( 'rsnc_mappings' );
 delete_option( 'rsnc_interval' );

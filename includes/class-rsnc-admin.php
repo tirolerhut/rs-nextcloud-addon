@@ -18,6 +18,8 @@ class RSNC_Admin {
 		add_action( 'admin_post_rsnc_github', array( __CLASS__, 'handle_github' ) );
 		add_action( 'wp_ajax_rsnc_slides', array( __CLASS__, 'ajax_slides' ) );
 		add_action( 'wp_ajax_rsnc_test', array( __CLASS__, 'ajax_test' ) );
+		add_action( 'wp_ajax_rsnc_sync_step', array( __CLASS__, 'ajax_sync_step' ) );
+		add_action( 'wp_ajax_rsnc_sync_status', array( __CLASS__, 'ajax_sync_status' ) );
 		add_filter( 'plugin_action_links_' . plugin_basename( RSNC_FILE ), array( __CLASS__, 'action_links' ) );
 	}
 
@@ -60,6 +62,10 @@ class RSNC_Admin {
 		}
 		if ( ! empty( $r['duplicates'] ) ) {
 			$msg .= ' ' . __( 'Übersprungen (gleiches Foto mehrfach in Nextcloud):', 'rs-nextcloud' ) . ' ' . implode( ', ', $r['duplicates'] ) . '.';
+		}
+		if ( ! empty( $r['pending'] ) && $r['pending'] > 0 ) {
+			/* translators: %d: count */
+			$msg .= ' ' . sprintf( __( 'Noch %d Bild(er) ausstehend – „Jetzt abgleichen“ setzt fort, sonst übernimmt das der Cron.', 'rs-nextcloud' ), $r['pending'] );
 		}
 		if ( $r['errors'] ) {
 			$msg .= ' ' . __( 'Fehler:', 'rs-nextcloud' ) . ' ' . implode( ' | ', $r['errors'] );
@@ -105,12 +111,9 @@ class RSNC_Admin {
 		);
 		$id = RSNC_Settings::save_mapping( $mapping );
 
-		if ( ! empty( $in['sync_now'] ) ) {
-			self::notice( 'info', self::format_result( RSNC_Sync::run( $id ) ) );
-		} else {
-			self::notice( 'success', __( 'Gespeichert.', 'rs-nextcloud' ) );
-		}
-		wp_safe_redirect( self::page_url() );
+		self::notice( 'success', __( 'Gespeichert.', 'rs-nextcloud' ) );
+		// Abgleich nicht hier ausführen (Zeitlimit!), sondern in Etappen auf der Übersichtsseite.
+		wp_safe_redirect( self::page_url( ! empty( $in['sync_now'] ) ? array( 'rsnc_autosync' => $id ) : array() ) );
 		exit;
 	}
 
@@ -129,10 +132,36 @@ class RSNC_Admin {
 	public static function handle_sync() {
 		self::check( 'rsnc_sync' );
 		$id = sanitize_key( $_GET['id'] ?? '' );
-		$r  = RSNC_Sync::run( $id );
-		self::notice( $r['errors'] ? 'warning' : 'success', self::format_result( $r ) );
+		$r  = RSNC_Sync::run( $id ); // Fallback ohne JavaScript: eine Etappe
+		self::notice( $r['errors'] ? 'warning' : ( $r['pending'] ? 'info' : 'success' ), self::format_result( $r ) );
 		wp_safe_redirect( self::page_url() );
 		exit;
+	}
+
+	/** Eine Etappe des Abgleichs (vom Browser wiederholt aufgerufen, bis alles erledigt ist). */
+	public static function ajax_sync_step() {
+		check_ajax_referer( 'rsnc_ajax' );
+		if ( ! current_user_can( self::CAP ) ) {
+			wp_send_json_error( 'Keine Berechtigung.' );
+		}
+		$id = sanitize_key( $_POST['id'] ?? '' );
+		if ( ! RSNC_Settings::get_mapping( $id ) ) {
+			wp_send_json_error( 'Zuordnung nicht gefunden.' );
+		}
+		if ( ! empty( $_POST['fresh'] ) ) {
+			RSNC_Sync::reset_failed( $id ); // manueller Start: übersprungene Bilder erneut versuchen
+		}
+		$r = RSNC_Sync::run( $id );
+		wp_send_json_success( $r );
+	}
+
+	/** Gespeicherter Status – z. B. die Absturzursache, wenn eine Etappe mit Fehler 500 endete. */
+	public static function ajax_sync_status() {
+		check_ajax_referer( 'rsnc_ajax' );
+		if ( ! current_user_can( self::CAP ) ) {
+			wp_send_json_error( 'Keine Berechtigung.' );
+		}
+		wp_send_json_success( RSNC_Settings::get_status( sanitize_key( $_POST['id'] ?? '' ) ) );
 	}
 
 	public static function handle_interval() {
@@ -251,6 +280,9 @@ class RSNC_Admin {
 				$st = esc_html( date_i18n( get_option( 'date_format' ) . ' H:i', $status['time'] + ( get_option( 'gmt_offset' ) * HOUR_IN_SECONDS ) ) )
 					. '<br><small>+' . (int) $status['added'] . ' / ~' . (int) $status['updated'] . ' / −' . (int) $status['removed']
 					. ( ! empty( $status['duplicates'] ) ? ' · ' . count( $status['duplicates'] ) . ' Duplikat(e) übersprungen' : '' ) . '</small>';
+				if ( ! empty( $status['pending'] ) && $status['pending'] > 0 ) {
+					$st .= '<br><span style="color:#996800">' . esc_html( sprintf( 'Unvollständig – noch %d Bild(er), wird fortgesetzt.', $status['pending'] ) ) . '</span>';
+				}
 				if ( $status['errors'] ) {
 					$st .= '<br><span style="color:#b32d2e">' . esc_html( implode( ' | ', $status['errors'] ) ) . '</span>';
 				}
@@ -263,14 +295,15 @@ class RSNC_Admin {
 			echo '<td><strong>' . esc_html( $m['name'] ? $m['name'] : $id ) . '</strong>' . ( $m['active'] ? '' : ' <em>(inaktiv)</em>' ) . '</td>';
 			echo '<td><code>' . esc_html( $m['share_url'] ) . ( $m['subfolder'] ? ' → /' . esc_html( $m['subfolder'] ) : '' ) . '</code></td>';
 			echo '<td>' . esc_html( $sliders[ $m['slider_id'] ] ?? '#' . $m['slider_id'] ) . '</td>';
-			echo '<td>' . $st . '</td>'; // phpcs:ignore -- bereits escaped
-			echo '<td><a class="button" href="' . esc_url( $sync ) . '">Jetzt abgleichen</a> ';
+			echo '<td class="rsnc-status" data-id="' . esc_attr( $id ) . '">' . $st . '</td>'; // phpcs:ignore -- bereits escaped
+			echo '<td><a class="button rsnc-sync" data-id="' . esc_attr( $id ) . '" href="' . esc_url( $sync ) . '">Jetzt abgleichen</a> ';
 			echo '<a class="button" href="' . esc_url( self::page_url( array( 'edit' => $id ) ) ) . '">Bearbeiten</a> ';
 			echo '<a class="button-link-delete" href="' . esc_url( $del ) . '" onclick="return confirm(\'Zuordnung löschen? Slides bleiben erhalten.\')">Löschen</a> | ';
 			echo '<a class="button-link-delete" href="' . esc_url( $purge ) . '" onclick="return confirm(\'Zuordnung UND alle erzeugten Slides und Bilder löschen?\')">inkl. Slides</a></td>';
 			echo '</tr>';
 		}
 		echo '</tbody></table>';
+		self::render_sync_script();
 
 		$interval = RSNC_Settings::get_interval();
 		$next     = wp_next_scheduled( RSNC_CRON_HOOK );
@@ -301,6 +334,86 @@ class RSNC_Admin {
 			. '<li>Hier eine Zuordnung anlegen: öffentlicher Nextcloud-Link (<code>https://cloud…/s/TOKEN</code>), Ziel-Slider, Vorlage.</li>'
 			. '<li>Für jedes Bild entsteht eine eigene Slide. Neue, geänderte und gelöschte Bilder werden beim Abgleich übernommen. Änderungen an der Vorlage werden beim nächsten Abgleich auf alle Slides angewendet.</li>'
 			. '</ol>';
+	}
+
+	/** Abgleich im Browser in Etappen ausführen – keine langen Seitenaufrufe, kein Fehler 500 durch Zeitlimits. */
+	private static function render_sync_script() {
+		$auto = isset( $_GET['rsnc_autosync'] ) ? sanitize_key( $_GET['rsnc_autosync'] ) : '';
+		?>
+		<script>
+		(function(){
+			var ajax = <?php echo wp_json_encode( admin_url( 'admin-ajax.php' ) ); ?>,
+				nonce = <?php echo wp_json_encode( wp_create_nonce( 'rsnc_ajax' ) ); ?>,
+				auto = <?php echo wp_json_encode( $auto ); ?>;
+
+			function post(action, id, fresh){
+				var fd = new FormData();
+				fd.append('action', action); fd.append('_ajax_nonce', nonce); fd.append('id', id);
+				if (fresh) { fd.append('fresh', '1'); }
+				return fetch(ajax, {method:'POST', body:fd, credentials:'same-origin'}).then(function(r){
+					if (!r.ok) { throw new Error('HTTP ' + r.status); }
+					return r.json();
+				});
+			}
+			function esc(t){ var d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
+
+			function start(btn){
+				var id = btn.dataset.id, cell = document.querySelector('.rsnc-status[data-id="' + id + '"]');
+				var sum = {added:0, updated:0, removed:0, renamed:0, cleaned:0}, dup = {}, errs = [], fails = 0, busy = 0, total = 0;
+				btn.classList.add('disabled'); btn.textContent = 'Abgleich läuft …';
+				function show(text, color){ cell.innerHTML = '<span style="color:' + (color || 'inherit') + '">' + text + '</span>'; }
+				function finish(){
+					btn.classList.remove('disabled'); btn.textContent = 'Jetzt abgleichen';
+					var t = 'Fertig: ' + sum.added + ' neu, ' + sum.updated + ' aktualisiert, ' + sum.removed + ' entfernt'
+						+ (sum.renamed ? ', ' + sum.renamed + ' umbenannt' : '') + (sum.cleaned ? ', ' + sum.cleaned + ' Duplikat(e) bereinigt' : '');
+					var d = Object.keys(dup);
+					if (d.length) { t += '<br><small>Übersprungen (gleiches Foto): ' + esc(d.join(', ')) + '</small>'; }
+					if (errs.length) { t += '<br><span style="color:#b32d2e">' + esc(errs.join(' | ')) + '</span>'; }
+					show(t, errs.length ? '#996800' : '#008a20');
+				}
+				var first = true;
+				function step(){
+					var fresh = first; first = false;
+					post('rsnc_sync_step', id, fresh).then(function(r){
+						if (!r.success) { errs.push(r.data || 'Fehler'); return finish(); }
+						var d = r.data; fails = 0;
+						if (d.busy) {
+							if (++busy > 12) { errs.push('Ein anderer Abgleich läuft noch.'); return finish(); }
+							show('Warte auf laufenden Abgleich …'); return setTimeout(step, 5000);
+						}
+						busy = 0;
+						['added','updated','removed','renamed','cleaned'].forEach(function(k){ sum[k] += d[k] || 0; });
+						(d.duplicates || []).forEach(function(x){ dup[x] = 1; });
+						(d.errors || []).forEach(function(e){ if (errs.indexOf(e) < 0) errs.push(e); });
+						total = d.total || total;
+						if (d.pending > 0 || d.pending === -1) {
+							show('Abgleich läuft … ' + (total - Math.max(d.pending, 0)) + ' von ' + total + ' Bildern geprüft');
+							return setTimeout(step, 300);
+						}
+						finish();
+					}).catch(function(e){
+						// Etappe abgebrochen (z. B. Fehler 500) → Ursache holen und fortsetzen.
+						if (++fails > 4) { errs.push('Abgleich mehrfach abgebrochen (' + e.message + ').'); return finish(); }
+						post('rsnc_sync_status', id).then(function(r){
+							var msg = r && r.success && r.data && r.data.interrupted && r.data.errors ? r.data.errors[0] : e.message;
+							if (errs.indexOf(msg) < 0) { errs.push(msg); }
+							show('Etappe abgebrochen: ' + esc(msg) + ' – setze fort …', '#996800');
+						}).catch(function(){}).then(function(){ setTimeout(step, 2000); });
+					});
+				}
+				show('Abgleich startet …'); step();
+			}
+
+			document.querySelectorAll('.rsnc-sync').forEach(function(btn){
+				btn.addEventListener('click', function(ev){
+					ev.preventDefault();
+					if (!btn.classList.contains('disabled')) { start(btn); }
+				});
+				if (auto && btn.dataset.id === auto) { start(btn); }
+			});
+		})();
+		</script>
+		<?php
 	}
 
 	private static function render_updates() {

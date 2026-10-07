@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       Slider Revolution – Nextcloud Add-on
  * Description:       Lädt Bilder direkt aus einer öffentlichen Nextcloud-Freigabe und erzeugt daraus automatisch Slides in Slider Revolution 6.
- * Version:           1.3.0
+ * Version:           1.3.1
  * Requires at least: 5.8
  * Requires PHP:      7.4
  * Author:            Alexander
@@ -13,7 +13,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'RSNC_VERSION', '1.3.0' );
+define( 'RSNC_VERSION', '1.3.1' );
 define( 'RSNC_FILE', __FILE__ );
 define( 'RSNC_DIR', plugin_dir_path( __FILE__ ) );
 define( 'RSNC_CRON_HOOK', 'rsnc_cron_sync' );
@@ -39,6 +39,7 @@ register_activation_hook( __FILE__, array( 'RSNC_Settings', 'schedule' ) );
 register_deactivation_hook( __FILE__, array( 'RSNC_Settings', 'unschedule' ) );
 
 add_action( RSNC_CRON_HOOK, array( 'RSNC_Sync', 'run_all' ) );
+add_action( 'rsnc_cron_continue', array( 'RSNC_Sync', 'continue_run' ) );
 
 add_action(
 	'plugins_loaded',
