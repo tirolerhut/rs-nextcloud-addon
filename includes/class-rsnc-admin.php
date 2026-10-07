@@ -50,6 +50,17 @@ class RSNC_Admin {
 	private static function format_result( array $r ) {
 		/* translators: 1: added 2: updated 3: removed 4: unchanged */
 		$msg = sprintf( __( 'Abgleich: %1$d neu, %2$d aktualisiert, %3$d entfernt, %4$d unverändert.', 'rs-nextcloud' ), $r['added'], $r['updated'], $r['removed'], $r['unchanged'] );
+		if ( ! empty( $r['renamed'] ) ) {
+			/* translators: %d: count */
+			$msg .= ' ' . sprintf( __( '%d Datei(en) umbenannt/auf Originalnamen umgestellt.', 'rs-nextcloud' ), $r['renamed'] );
+		}
+		if ( ! empty( $r['cleaned'] ) ) {
+			/* translators: %d: count */
+			$msg .= ' ' . sprintf( __( '%d doppelte Slide(s)/verwaiste Bilder entfernt.', 'rs-nextcloud' ), $r['cleaned'] );
+		}
+		if ( ! empty( $r['duplicates'] ) ) {
+			$msg .= ' ' . __( 'Übersprungen (gleiches Foto mehrfach in Nextcloud):', 'rs-nextcloud' ) . ' ' . implode( ', ', $r['duplicates'] ) . '.';
+		}
 		if ( $r['errors'] ) {
 			$msg .= ' ' . __( 'Fehler:', 'rs-nextcloud' ) . ' ' . implode( ' | ', $r['errors'] );
 		}
@@ -238,7 +249,8 @@ class RSNC_Admin {
 			$st     = '–';
 			if ( $status ) {
 				$st = esc_html( date_i18n( get_option( 'date_format' ) . ' H:i', $status['time'] + ( get_option( 'gmt_offset' ) * HOUR_IN_SECONDS ) ) )
-					. '<br><small>+' . (int) $status['added'] . ' / ~' . (int) $status['updated'] . ' / −' . (int) $status['removed'] . '</small>';
+					. '<br><small>+' . (int) $status['added'] . ' / ~' . (int) $status['updated'] . ' / −' . (int) $status['removed']
+					. ( ! empty( $status['duplicates'] ) ? ' · ' . count( $status['duplicates'] ) . ' Duplikat(e) übersprungen' : '' ) . '</small>';
 				if ( $status['errors'] ) {
 					$st .= '<br><span style="color:#b32d2e">' . esc_html( implode( ' | ', $status['errors'] ) ) . '</span>';
 				}

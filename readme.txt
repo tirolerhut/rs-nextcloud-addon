@@ -35,8 +35,25 @@ Zeilenumbrüche in der Caption werden als <br> ausgegeben.
 Die Caption wird außerdem als Beschriftung und Alt-Text in der Mediathek gespeichert.
 
 == Abgleich ==
-- Neue Bilder → neue Slide; geänderte Bilder (ETag) → Bild wird ersetzt;
-  gelöschte Bilder → Slide wird entfernt (abschaltbar).
+- Neue Bilder → neue Slide; geänderte Bilder → Bild wird ersetzt (gleiche Slide,
+  gleiche Mediendatei); gelöschte Bilder → Slide wird entfernt (abschaltbar).
+- Jedes Foto erscheint genau einmal im Slider:
+  · Unveränderte Bilder werden nicht erneut heruntergeladen (ETag bzw. Größe + Datum).
+  · Identische Fotos unter verschiedenen Namen werden am Inhalt (SHA-1) erkannt
+    und nur einmal übernommen.
+  · In Nextcloud umbenannte/verschobene Fotos behalten ihre Slide.
+  · Parallele Läufe sind gesperrt; der Fortschritt wird nach jedem Bild gesichert.
+  · Jede erzeugte Slide trägt eine Kennung. Geht die interne Liste verloren
+    (Neuinstallation, Zuordnung neu angelegt), werden vorhandene Slides übernommen
+    statt neu angelegt. Doppelte Slides aus älteren Versionen werden entfernt.
+  · Im Editor kopierte Slides: veröffentlicht = Duplikat (wird entfernt),
+    unveröffentlicht = Vorlage (bleibt unangetastet).
+- Dateinamen bleiben exakt erhalten (inkl. Leerzeichen, Umlaute, Klammern).
+  Die Bilder liegen in wp-content/uploads/nextcloud/<Zuordnung>/. Entfernt werden
+  nur Zeichen, die in Dateisystemen/URLs nicht funktionieren: / \ : * ? " < > | # %
+  WordPress verkleinert diese Bilder nicht zu „-scaled“; für kleinere Dateien im
+  Slider die Option „Bildgröße“ verwenden (z. B. „2048x2048“ oder „large“).
+  Bilder aus Version 1.2 werden beim ersten Lauf lokal auf den Originalnamen umgestellt.
 - Automatisch per WP-Cron (stündlich / 2× täglich / täglich) oder manuell.
 - WP-CLI: wp rsnc list | wp rsnc sync <id> | wp rsnc sync --all
 - Tipp: Für zuverlässige Läufe echten Server-Cron statt WP-Cron verwenden.
